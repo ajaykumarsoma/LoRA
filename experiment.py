@@ -53,3 +53,68 @@ np.random.seed(SEED)
 PLOTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots")
 # Structure: MI-Projects/Finetuning/LoRA/experiment.py
 #            MI-Projects/MinimalTransformer/data/shakespeare.txt
+CORPUS = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "../../MinimalTransformer/data/shakespeare.txt"))
+
+os.makedirs(PLOTS_DIR, exist_ok=True)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+LORA_RANKS   = [1, 4, 16, 64]  # 4 ranks — enough for a clear efficiency curve
+LORA_ALPHA   = 32              # scaling factor; scale = alpha / rank
+TRAIN_STEPS  = 300             # per rank — ~14 min total on M4 CPU
+FULL_STEPS   = 300             # for full fine-tune reference
+BATCH        = 8               # M4 CPU handles this well
+SEQ_LEN      = 32              # short context: 32² attn = 4x faster than 64²
+LR_LORA      = 3e-4
+LR_FULL      = 1e-5            # lower LR for full fine-tune to avoid instability
+EVAL_BATCHES = 10              # batches for val perplexity estimate
+
+print("=" * 60)
+print("LoRA Fine-tuning — GPT-2 Small on Tiny Shakespeare")
+print("=" * 60)
+print(f"  Device : {DEVICE}")
+print(f"  Ranks  : {LORA_RANKS}")
+print(f"  Steps  : {TRAIN_STEPS} per rank + {FULL_STEPS} full fine-tune")
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+print("\nLoading tokenizer and corpus...")
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+tokenizer.pad_token = tokenizer.eos_token
+
+text   = open(CORPUS, encoding="utf-8").read()
+tokens = tokenizer.encode(text)
+tokens = torch.tensor(tokens, dtype=torch.long)
+split  = int(0.9 * len(tokens))
+train_tok = tokens[:split]
+val_tok   = tokens[split:]
+print(f"  Train tokens: {len(train_tok):,}  |  Val tokens: {len(val_tok):,}")
+
+def get_batch(split="train"):
+    src = train_tok if split == "train" else val_tok
+    ix  = torch.randint(len(src) - SEQ_LEN - 1, (BATCH,))
+    x   = torch.stack([src[i : i + SEQ_LEN]     for i in ix]).to(DEVICE)
+    y   = torch.stack([src[i + 1 : i + SEQ_LEN + 1] for i in ix]).to(DEVICE)
+    return x, y
+
+# ── LoRA module ───────────────────────────────────────────────────────────────
+class LoRALayer(nn.Module):
+    """
+    Wraps a frozen Conv1D or nn.Linear and adds a trainable low-rank residual.
+
+    GPT-2 (HuggingFace) uses Conv1D whose weight is stored as (d_in, d_out),
+    so the forward is  x @ W + b.  nn.Linear stores weight as (d_out, d_in)
+    and applies  x @ W.T + b.  Both produce the same output shape; we detect
+    which we have and read dimensions accordingly.
+
+    LoRA residual: (x @ A @ B) * scale   — same shape as base output.
+    A: Kaiming init  |  B: zero init  → ΔW = 0 at step 0.
+    """
+    def __init__(self, layer, rank: int, alpha: float):
+        super().__init__()
+        self.layer = layer
+        for p in self.layer.parameters():
+            p.requires_grad = False
+
+        if isinstance(layer, Conv1D):
+            d_in, d_out = layer.weight.shape   # Conv1D: (d_in, d_out)
+        else:
