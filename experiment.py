@@ -118,3 +118,63 @@ class LoRALayer(nn.Module):
         if isinstance(layer, Conv1D):
             d_in, d_out = layer.weight.shape   # Conv1D: (d_in, d_out)
         else:
+            d_out, d_in = layer.weight.shape   # nn.Linear: (d_out, d_in)
+
+        self.scale  = alpha / rank
+        self.lora_A = nn.Parameter(torch.empty(d_in, rank))
+        self.lora_B = nn.Parameter(torch.zeros(rank, d_out))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+
+    def forward(self, x):
+        return self.layer(x) + (x @ self.lora_A @ self.lora_B) * self.scale
+
+    @property
+    def n_trainable(self):
+        return self.lora_A.numel() + self.lora_B.numel()
+
+# ── Apply LoRA to GPT-2 ───────────────────────────────────────────────────────
+def apply_lora(model, rank, alpha):
+    """
+    Replace all attention projection linears in GPT-2 with LoRA wrappers.
+    GPT-2's attention uses:
+      c_attn  : combined QKV projection  (d_model → 3*d_model)
+      c_proj  : output projection        (d_model → d_model)
+    We wrap both for each of the 12 transformer blocks.
+    """
+    total_lora_params = 0
+    for block in model.transformer.h:
+        attn = block.attn
+        attn.c_attn = LoRALayer(attn.c_attn, rank, alpha).to(DEVICE)
+        attn.c_proj = LoRALayer(attn.c_proj, rank, alpha).to(DEVICE)
+        total_lora_params += attn.c_attn.n_trainable + attn.c_proj.n_trainable
+    return total_lora_params
+
+def freeze_all(model):
+    for p in model.parameters():
+        p.requires_grad = False
+
+def count_trainable(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+# ── Eval perplexity ───────────────────────────────────────────────────────────
+@torch.no_grad()
+def eval_ppl(model):
+    model.eval()
+    losses = []
+    for _ in range(EVAL_BATCHES):
+        x, y = get_batch("val")
+        out  = model(x, labels=y)
+        losses.append(out.loss.item())
+    model.train()
+    return math.exp(np.mean(losses))
+
+# ── Training loop ─────────────────────────────────────────────────────────────
+def train_loop(model, steps, lr, label):
+    opt = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=lr, weight_decay=0.01)
+    t0 = time.time()
+    for step in range(1, steps + 1):
+        x, y   = get_batch("train")
+        out    = model(x, labels=y)
+        loss   = out.loss
